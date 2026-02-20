@@ -20,3 +20,4 @@ build/
 # Backup / temp
 *.bak
 *.tmp
+/copilot-instructions.md
