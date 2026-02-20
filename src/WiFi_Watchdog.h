@@ -59,6 +59,8 @@ extern "C" {
 	#include <lwip/sys.h>
 #if defined(ESP8266)
 	#include <user_interface.h>
+#elif defined(ESP32)
+	#include <lwip/tcpip.h>
 #endif
 }
 
@@ -345,6 +347,7 @@ private:
 	// Reconnection tracking
 	unsigned long _lastReconnectAttempt;   ///< millis() of last reconnection attempt.
 	unsigned long _reconnectInterval;      ///< Delay between reconnection attempts.
+	unsigned long _lastWatchdogRun;        ///< millis() of last watchdog() execution.
 	uint8_t _consecutiveFailures;          ///< Counter for escalation strategy.
 
 	// --- Pinger state ---

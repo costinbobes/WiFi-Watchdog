@@ -28,28 +28,30 @@ u8_t WiFi_Watchdog::icmpReceiveCallback(void *arg, struct raw_pcb *pcb,
 										struct pbuf *p, const ip_addr_t *addr) {
 	WiFi_Watchdog *self = (WiFi_Watchdog *)arg;
 
-	if (p->tot_len < (PBUF_IP_HLEN + sizeof(struct icmp_echo_hdr))) {
-		return 0; // too small, not consumed
-	}
-
-	// Skip past IP header to reach ICMP header
-	if (pbuf_header(p, -(s16_t)PBUF_IP_HLEN) != 0) {
+	// Need at least a minimal IP header (20) + ICMP echo header (8)
+	if (p->tot_len < 28) {
 		return 0;
 	}
 
-	struct icmp_echo_hdr *iecho = (struct icmp_echo_hdr *)p->payload;
+	// Read actual IPv4 header length from byte 0 (IHL field, lower nibble, in 32-bit words)
+	u8_t ip_ver_ihl;
+	pbuf_copy_partial(p, &ip_ver_ihl, 1, 0);
+	u16_t ip_hdr_len = (ip_ver_ihl & 0x0F) * 4;
+
+	// Read the ICMP header at offset ip_hdr_len (without modifying the pbuf)
+	struct icmp_echo_hdr iecho;
+	if (pbuf_copy_partial(p, &iecho, sizeof(iecho), ip_hdr_len) != sizeof(iecho)) {
+		return 0;
+	}
 
 	// Check: is this an echo reply with our packet ID?
-	if (ICMPH_TYPE(iecho) == ICMP_ER && iecho->id == htons(PING_PACKET_ID)) {
+	if (ICMPH_TYPE(&iecho) == ICMP_ER && iecho.id == htons(PING_PACKET_ID)) {
 		self->_icmpReplyReceived = true;
-		pbuf_header(p, (s16_t)PBUF_IP_HLEN); // restore offset
 		pbuf_free(p);
 		return 1; // consumed
 	}
 
-	// Not ours — restore offset and let lwip pass it on
-	pbuf_header(p, (s16_t)PBUF_IP_HLEN);
-	return 0;
+	return 0; // not ours, let lwip pass it on
 }
 
 // =====================================================================
@@ -66,6 +68,7 @@ WiFi_Watchdog::WiFi_Watchdog()
 	, _wifiMode(WIFI_STA)
 	, _lastReconnectAttempt(0)
 	, _reconnectInterval(DEFAULT_RECONNECT_INTERVAL)
+	, _lastWatchdogRun(0)
 	, _consecutiveFailures(0)
 	, _pingerEnabled(true)
 	, _pingInterval(DEFAULT_PING_INTERVAL)
@@ -123,11 +126,23 @@ void WiFi_Watchdog::reset() {
 // Watchdog – call from loop(), fully non-blocking
 // =====================================================================
 void WiFi_Watchdog::watchdog() {
+	// Throttle: skip if called again within 100 ms
+	uint32_t now = millis();
+	if (now - _lastWatchdogRun < 100) {
+		return;
+	}
+	_lastWatchdogRun = now;
+
 	yield();
 
 	wl_status_t wifiStatus = WiFi.status();
 	IPAddress   localIP    = WiFi.localIP();
 	bool        hasValidIP = (localIP[0] != 0);
+
+	// Reject APIPA / link-local addresses (169.254.x.x) — not a real connection
+	if (hasValidIP && localIP[0] == 169 && localIP[1] == 254) {
+		hasValidIP = false;
+	}
 
 	// --- Connected with valid IP ---
 	if (wifiStatus == WL_CONNECTED && hasValidIP) {
@@ -177,7 +192,6 @@ void WiFi_Watchdog::watchdog() {
 		_lastReconnectAttempt = 0; // trigger immediate reconnect attempt
 	}
 
-	unsigned long now = millis();
 	if (now - _lastReconnectAttempt >= _reconnectInterval) {
 		WD_LOGLN(F("[WiFi Watchdog] Attempting reconnection..."));
 		_lastReconnectAttempt = now;
@@ -362,9 +376,16 @@ void WiFi_Watchdog::sendPing() {
 
 	_icmpReplyReceived = false;
 
+#if defined(ESP32)
+	LOCK_TCPIP_CORE();
+#endif
+
 	// Create raw PCB for ICMP
 	_pingPcb = raw_new(IP_PROTO_ICMP);
 	if (_pingPcb == nullptr) {
+#if defined(ESP32)
+		UNLOCK_TCPIP_CORE();
+#endif
 		WD_LOGLN(F("[WiFi Watchdog] Failed to create ICMP PCB"));
 		_lastPingTime = millis();
 		return;
@@ -379,6 +400,9 @@ void WiFi_Watchdog::sendPing() {
 	if (p == nullptr) {
 		raw_remove(_pingPcb);
 		_pingPcb = nullptr;
+#if defined(ESP32)
+		UNLOCK_TCPIP_CORE();
+#endif
 		WD_LOGLN(F("[WiFi Watchdog] Failed to allocate ICMP packet"));
 		_lastPingTime = millis();
 		return;
@@ -393,11 +417,21 @@ void WiFi_Watchdog::sendPing() {
 	iecho->seqno  = htons(1);
 	iecho->chksum = inet_chksum(iecho, packetSize);
 
-	// Send
+	// Send packet to target IP
+	// ESP32's lwIP has IPv6 support, so ip_addr_t uses a union structure instead of a flat addr field
 	ip_addr_t dest;
+#if defined(ESP32)
+	dest.u_addr.ip4.addr = (uint32_t)target;
+	dest.type = IPADDR_TYPE_V4;
+#else
 	dest.addr = (uint32_t)target;
+#endif
 	raw_sendto(_pingPcb, p, &dest);
 	pbuf_free(p);
+
+#if defined(ESP32)
+	UNLOCK_TCPIP_CORE();
+#endif
 
 	// Transition to SENT state — return to loop immediately
 	_pingSentTime = millis();
@@ -440,7 +474,13 @@ void WiFi_Watchdog::checkPingReply() {
 // =====================================================================
 void WiFi_Watchdog::cleanupPing() {
 	if (_pingPcb != nullptr) {
+#if defined(ESP32)
+		LOCK_TCPIP_CORE();
+#endif
 		raw_remove(_pingPcb);
+#if defined(ESP32)
+		UNLOCK_TCPIP_CORE();
+#endif
 		_pingPcb = nullptr;
 	}
 	_pingState = PingState::IDLE;
