@@ -314,13 +314,20 @@ void WiFi_Watchdog::performFullReset() {
 }
 
 void WiFi_Watchdog::applyNetworkConfig() {
-	if (_hostname != nullptr) {
-#if defined(ESP8266)
-		WiFi.hostname(_hostname);
-#elif defined(ESP32)
-		WiFi.setHostname(_hostname);
-#endif
+	// If no hostname was set, generate one from last 6 hex chars of MAC
+	if (_hostname == nullptr) {
+		String mac = WiFi.macAddress();    // "AA:BB:CC:DD:EE:FF"
+		static char autoName[13];          // "ESP_DDEEFF\0"
+		snprintf(autoName, sizeof(autoName), "ESP_%c%c%c%c%c%c",
+			mac[9], mac[10], mac[12], mac[13], mac[15], mac[16]);
+		_hostname = autoName;
 	}
+
+#if defined(ESP8266)
+	WiFi.hostname(_hostname);
+#elif defined(ESP32)
+	WiFi.setHostname(_hostname);
+#endif
 
 	if (_useStaticIP) {
 		WiFi.config(_staticIP, _gateway, _subnet);
