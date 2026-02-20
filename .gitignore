@@ -8,6 +8,7 @@
 ipch/
 *.VC.db
 *.opendb
+*.vcxitems.filters
 
 # Arduino build artifacts
 *.elf
