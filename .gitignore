@@ -1,0 +1,21 @@
+# Visual Studio / VisualMicro
+.vs/
+*.sln
+*.slnx
+*.vcxproj
+*.vcxitems
+*.user
+ipch/
+*.VC.db
+*.opendb
+
+# Arduino build artifacts
+*.elf
+*.bin
+*.hex
+*.eep
+build/
+
+# Backup / temp
+*.bak
+*.tmp
