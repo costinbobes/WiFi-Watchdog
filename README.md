@@ -14,7 +14,7 @@ WiFi-Watchdog monitors your ESP's WiFi connection using both the built-in `WiFi.
 
 | Feature | Description |
 |---------|-------------|
-| **Auto-reconnect** | Escalating strategy: soft `WiFi.reconnect()` → full disconnect/reconnect after repeated failures |
+| **Auto-reconnect** | Escalating strategy: soft `WiFi.reconnect()` → full disconnect/reconnect after repeated failures (configurable thresholds) |
 | **ICMP ping watchdog** | Non-blocking gateway ping via lwip raw API; detects upstream isolation even when WiFi reports connected |
 | **100ms throttle** | Built-in call throttling prevents excessive execution if called from a tight loop |
 | **APIPA rejection** | Treats `169.254.x.x` addresses as invalid, triggering reconnection |
@@ -23,7 +23,7 @@ WiFi-Watchdog monitors your ESP's WiFi connection using both the built-in `WiFi.
 | **Auto hostname** | Generates `ESP_ABCDEF` from MAC address if no hostname is set |
 | **Custom ping target** | Override the default gateway with any IP on your network |
 | **Runtime debug** | Enable/disable serial debug output with `setDebug(true)` — no recompilation needed |
-| **ESP32 multi-core safe** | Shared state protected by `portMUX` spinlock, lwip calls wrapped with TCPIP core lock |
+| **ESP32 multi-core safe** | Shared state protected by `portMUX` spinlock + `std::atomic`, lwip calls wrapped with TCPIP core lock |
 | **Zero dependencies** | Uses lwip raw API directly — no external ping library required |
 
 ---
@@ -51,13 +51,13 @@ WiFi-Watchdog monitors your ESP's WiFi connection using both the built-in `WiFi.
 
 WiFi_Watchdog wifi;
 
-void onStatusChange(WiFiWatchdogStatus status) {
+void onStatusChange(WiFi_WatchdogStatus status) {
     switch (status) {
-        case WiFiWatchdogStatus::CONNECTED:
+        case WiFi_WatchdogStatus::CONNECTED:
             Serial.print("Connected, IP: ");
             Serial.println(wifi.getIPAddress());
             break;
-        case WiFiWatchdogStatus::CONNECTION_LOST:
+        case WiFi_WatchdogStatus::CONNECTION_LOST:
             Serial.println("Connection lost!");
             break;
         default: break;
@@ -86,7 +86,7 @@ void loop() {
 ### Connection Status
 
 ```cpp
-enum class WiFiWatchdogStatus {
+enum class WiFi_WatchdogStatus {
     DISCONNECTED,     // WiFi is off or explicitly disconnected
     CONNECTING,       // WiFi.begin() called, waiting for association
     CONNECTED,        // Associated with AP and has a valid IP
@@ -99,9 +99,9 @@ enum class WiFiWatchdogStatus {
 
 | Method | Description |
 |--------|-------------|
-| `connect(ssid, password)` | Connect to a WiFi network. Call configuration methods before this. |
+| `connect(ssid, password)` | Connect to a WiFi network. Strings are copied internally. Call configuration methods before this. |
 | `disconnect()` | Disconnect and stop all monitoring. |
-| `reset()` | Manual disconnect → re-apply config → reconnect. |
+| `reset()` | Manual non-blocking disconnect → re-apply config → reconnect. |
 
 ### Monitoring
 
@@ -113,8 +113,8 @@ enum class WiFiWatchdogStatus {
 
 | Method | Description |
 |--------|-------------|
-| `getStatus()` | Returns current `WiFiWatchdogStatus` (thread-safe on ESP32). |
-| `onStatusChange(callback)` | Register a `void(WiFiWatchdogStatus)` callback for status transitions. |
+| `getStatus()` | Returns current `WiFi_WatchdogStatus` (thread-safe on ESP32). |
+| `onStatusChange(callback)` | Register a `void(WiFi_WatchdogStatus)` callback for status transitions. |
 
 ### Network Info
 
@@ -128,10 +128,10 @@ enum class WiFiWatchdogStatus {
 
 | Method | Default | Description |
 |--------|---------|-------------|
-| `setHostname(hostname)` | `ESP_ABCDEF` | Set device hostname (auto-generated from MAC if not set). |
+| `setHostname(hostname)` | `ESP_ABCDEF` | Set device hostname (auto-generated from MAC if not set). String is copied internally. |
 | `useDHCP()` | ✓ | Use DHCP for IP configuration. |
-| `setStaticIP(ip, gw, subnet)` | - | Use static IP; overrides `useDHCP()`. |
-| `setWiFiMode(mode)` | `WIFI_STA` | Set WiFi mode: `WIFI_STA`, `WIFI_AP`, `WIFI_AP_STA`. |
+| `setStaticIP(ip, gw, subnet)` | - | Use static IP; overrides `useDHCP()`. DNS defaults to gateway. |
+| `setStaticIP(ip, gw, subnet, dns)` | - | Use static IP with explicit DNS server; overrides `useDHCP()`. |
 | `setDebug(enable)` | `false` | Enable/disable runtime serial debug output. |
 
 ### ICMP Pinger
@@ -139,9 +139,18 @@ enum class WiFiWatchdogStatus {
 | Method | Default | Description |
 |--------|---------|-------------|
 | `enablePinger(enable)` | `true` | Enable/disable the non-blocking ICMP ping. |
-| `setPingInterval(ms)` | `60000` | Interval between ping attempts (ms). |
-| `setPingTimeout(ms)` | `1000` | Per-ping reply timeout (ms). |
+| `setPingInterval(ms)` | `60000` | Interval between ping attempts (1000 – 86400000 ms). |
+| `setPingTimeout(ms)` | `1000` | Per-ping reply timeout (1000 – 30000 ms). |
 | `setPingTarget(ip)` | gateway | Override the ping destination. |
+| `clearPingTarget()` | - | Revert to pinging the default gateway. |
+
+### Threshold Configuration
+
+| Method | Default | Description |
+|--------|---------|-------------|
+| `setMaxFailuresBeforeReset(n)` | `5` | Consecutive WiFi reconnect failures before full reset (1 – 20). |
+| `setPingFailThreshold(n)` | `3` | Consecutive ICMP ping failures before WiFi reset (1 – 20). |
+| `setReconnectInterval(ms)` | `30000` | Interval between automatic reconnection attempts (1000 – 300000 ms). |
 
 ---
 
@@ -155,12 +164,13 @@ enum class WiFiWatchdogStatus {
 
 2. **Secondary detection**: Non-blocking ICMP ping to gateway (or custom target)
    - State machine: `IDLE` → `SENT` (never blocks)
-   - After 3 consecutive ping timeouts → full WiFi reset
+   - After 3 consecutive ping timeouts (configurable) → full WiFi reset
 
 3. **Reconnection strategy**:
    - Immediate first attempt when connection is lost
-   - Subsequent retries every 30 seconds
-   - After 5 consecutive failures → full reset (disconnect → delay → `WiFi.begin()`)
+   - Subsequent retries every 30 seconds (configurable via `setReconnectInterval()`)
+   - After 5 consecutive failures (configurable via `setMaxFailuresBeforeReset()`) → full reset (disconnect → `WiFi.begin()`)
+   - After 3 consecutive ping failures (configurable via `setPingFailThreshold()`) → full WiFi reset
 
 ### Non-Blocking ICMP Ping
 
@@ -220,8 +230,9 @@ void setup() {
     IPAddress ip(192, 168, 1, 200);
     IPAddress gw(192, 168, 1, 1);
     IPAddress sn(255, 255, 255, 0);
+    IPAddress dns(8, 8, 8, 8);  // optional: explicit DNS server
 
-    wifi.setStaticIP(ip, gw, sn);
+    wifi.setStaticIP(ip, gw, sn, dns);
     wifi.setHostname("sensor-node-01");
     wifi.connect("MySSID", "MyPassword");
 }
@@ -285,7 +296,7 @@ wifi.setPingTimeout(2000);      // 2 seconds
 **Solution**: The library's full reset (after 5 failures) should handle this. If it persists, add a manual reset:
 
 ```cpp
-if (wifi.getStatus() == WiFiWatchdogStatus::CONNECTION_LOST) {
+if (wifi.getStatus() == WiFi_WatchdogStatus::CONNECTION_LOST) {
     // after some time...
     wifi.reset();
 }

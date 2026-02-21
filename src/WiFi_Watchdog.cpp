@@ -15,14 +15,31 @@
 static const unsigned long DEFAULT_RECONNECT_INTERVAL = 30000;  // 30 seconds
 static const unsigned long DEFAULT_PING_INTERVAL      = 60000;  // 60 seconds
 static const unsigned long DEFAULT_PING_TIMEOUT       = 1000;   // 1 second
-static const uint8_t      MAX_FAILURES_BEFORE_RESET   = 5;
-static const uint8_t      PING_FAIL_THRESHOLD         = 3;
+static const uint8_t      DEFAULT_MAX_FAILURES        = 5;
+static const uint8_t      DEFAULT_PING_FAIL_THRESHOLD = 3;
 static const u16_t        PING_PACKET_ID              = 0xABCD;
+
+// --- Validation ranges ---
+static const unsigned long MIN_PING_INTERVAL      = 1000;       // 1 second
+static const unsigned long MAX_PING_INTERVAL      = 86400000UL; // 1 day
+static const unsigned long MIN_PING_TIMEOUT       = 1000;       // 1 second
+static const unsigned long MAX_PING_TIMEOUT       = 30000;      // 30 seconds
+static const uint8_t      MIN_THRESHOLD           = 1;
+static const uint8_t      MAX_THRESHOLD           = 20;
+static const unsigned long MIN_RECONNECT_INTERVAL = 1000;       // 1 second
+static const unsigned long MAX_RECONNECT_INTERVAL = 300000;     // 5 minutes
+static const unsigned long RESET_DELAY_MS         = 100;        // post-disconnect delay
+
+// --- Singleton tracking ---
+bool WiFi_Watchdog::_instanceExists = false;
 
 // =====================================================================
 // lwip ICMP receive callback (static)
 //   Called by lwip when any ICMP packet arrives.
 //   If it is an echo reply matching our ID, set the flag and consume it.
+//   NOTE: ICMP checksum is not validated — a received reply indicates
+//   a live connection; packet integrity is not the concern of this
+//   connectivity watchdog.
 // =====================================================================
 u8_t WiFi_Watchdog::icmpReceiveCallback(void *arg, struct raw_pcb *pcb,
 										struct pbuf *p, const ip_addr_t *addr) {
@@ -62,48 +79,95 @@ WiFi_Watchdog::WiFi_Watchdog()
 	, _password(nullptr)
 	, _hostname(nullptr)
 	, _debug(false)
-	, _status(WiFiWatchdogStatus::DISCONNECTED)
+	, _status(WiFi_WatchdogStatus::DISCONNECTED)
 	, _statusCallback(nullptr)
 	, _useStaticIP(false)
-	, _wifiMode(WIFI_STA)
+	, _hasDns(false)
+	, _resetPhase(ResetPhase::NONE)
+	, _resetStartTime(0)
 	, _lastReconnectAttempt(0)
 	, _reconnectInterval(DEFAULT_RECONNECT_INTERVAL)
 	, _lastWatchdogRun(0)
 	, _consecutiveFailures(0)
+	, _maxFailuresBeforeReset(DEFAULT_MAX_FAILURES)
 	, _pingerEnabled(true)
 	, _pingInterval(DEFAULT_PING_INTERVAL)
 	, _pingTimeout(DEFAULT_PING_TIMEOUT)
 	, _lastPingTime(0)
 	, _pingFailCount(0)
+	, _pingFailThreshold(DEFAULT_PING_FAIL_THRESHOLD)
 	, _pingState(PingState::IDLE)
 	, _pingSentTime(0)
 	, _pingPcb(nullptr)
 	, _icmpReplyReceived(false)
+	, _pingSeqNo(0)
 	, _hasPingTarget(false)
 {
 #if defined(ESP32)
 	_mutex = portMUX_INITIALIZER_UNLOCKED;
 #endif
+
+	if (_instanceExists) {
+		Serial.println(F("[WiFi Watchdog] WARNING: Only one WiFi_Watchdog instance should exist!"));
+	}
+	_instanceExists = true;
+}
+
+// =====================================================================
+// Destructor
+// =====================================================================
+WiFi_Watchdog::~WiFi_Watchdog() {
+	cleanupPing();
+	freeString(_ssid);
+	freeString(_password);
+	freeString(_hostname);
+	_instanceExists = false;
+}
+
+// =====================================================================
+// String helpers
+// =====================================================================
+void WiFi_Watchdog::freeString(char*& ptr) {
+	if (ptr != nullptr) {
+		free(ptr);
+		ptr = nullptr;
+	}
+}
+
+void WiFi_Watchdog::copyString(char*& dest, const char* src) {
+	freeString(dest);
+	dest = (src != nullptr) ? strdup(src) : nullptr;
 }
 
 // =====================================================================
 // Connection
 // =====================================================================
 void WiFi_Watchdog::connect(const char* ssid, const char* password) {
-	_ssid     = ssid;
-	_password = password;
+	// If already connected or connecting, disconnect first
+	if (_status != WiFi_WatchdogStatus::DISCONNECTED) {
+		cleanupPing();
+		WiFi.disconnect(true);
+		_resetPhase = ResetPhase::NONE;
+	}
 
-	WiFi.mode(_wifiMode);
+	copyString(_ssid, ssid);
+	copyString(_password, password);
+
+	_consecutiveFailures = 0;
+	_pingFailCount = 0;
+
+	WiFi.mode(WIFI_STA);
 	applyNetworkConfig();
 	WiFi.begin(_ssid, _password);
 
-	setStatus(WiFiWatchdogStatus::CONNECTING);
+	setStatus(WiFi_WatchdogStatus::CONNECTING);
 }
 
 void WiFi_Watchdog::disconnect() {
+	_resetPhase = ResetPhase::NONE;
 	cleanupPing();
 	WiFi.disconnect(true);
-	setStatus(WiFiWatchdogStatus::DISCONNECTED);
+	setStatus(WiFi_WatchdogStatus::DISCONNECTED);
 	_consecutiveFailures = 0;
 	_pingFailCount = 0;
 }
@@ -111,13 +175,12 @@ void WiFi_Watchdog::disconnect() {
 void WiFi_Watchdog::reset() {
 	cleanupPing();
 	WiFi.disconnect(true);
-	delay(100);
-	yield();
 
-	applyNetworkConfig();
-	WiFi.begin(_ssid, _password);
+	// Non-blocking: enter waiting phase, watchdog() will complete the reset
+	_resetPhase = ResetPhase::WAITING_AFTER_DISCONNECT;
+	_resetStartTime = millis();
 
-	setStatus(WiFiWatchdogStatus::RECONNECTING);
+	setStatus(WiFi_WatchdogStatus::RECONNECTING);
 	_consecutiveFailures = 0;
 	_pingFailCount = 0;
 }
@@ -135,6 +198,16 @@ void WiFi_Watchdog::watchdog() {
 
 	yield();
 
+	// --- Handle pending non-blocking reset ---
+	if (_resetPhase == ResetPhase::WAITING_AFTER_DISCONNECT) {
+		if (now - _resetStartTime >= RESET_DELAY_MS) {
+			_resetPhase = ResetPhase::NONE;
+			applyNetworkConfig();
+			WiFi.begin(_ssid, _password);
+		}
+		return;
+	}
+
 	wl_status_t wifiStatus = WiFi.status();
 	IPAddress   localIP    = WiFi.localIP();
 	bool        hasValidIP = (localIP[0] != 0);
@@ -146,11 +219,11 @@ void WiFi_Watchdog::watchdog() {
 
 	// --- Connected with valid IP ---
 	if (wifiStatus == WL_CONNECTED && hasValidIP) {
-		if (_status != WiFiWatchdogStatus::CONNECTED) {
+		if (_status != WiFi_WatchdogStatus::CONNECTED) {
 			_consecutiveFailures = 0;
 			_pingFailCount       = 0;
 			_lastPingTime        = 0; // fire first ping immediately
-			setStatus(WiFiWatchdogStatus::CONNECTED);
+			setStatus(WiFi_WatchdogStatus::CONNECTED);
 		}
 		_lastReconnectAttempt = millis();
 
@@ -179,16 +252,16 @@ void WiFi_Watchdog::watchdog() {
 	cleanupPing();
 
 	// --- Associated but no IP (DHCP issue) ---
+	// Disconnect without erasing config; the 100ms watchdog throttle
+	// provides sufficient delay before the next check
 	if (wifiStatus == WL_CONNECTED && !hasValidIP) {
 		WiFi.disconnect(false);
-		delay(100);
-		yield();
 		return;
 	}
 
 	// --- Not connected ---
-	if (_status == WiFiWatchdogStatus::CONNECTED) {
-		setStatus(WiFiWatchdogStatus::CONNECTION_LOST);
+	if (_status == WiFi_WatchdogStatus::CONNECTED) {
+		setStatus(WiFi_WatchdogStatus::CONNECTION_LOST);
 		_lastReconnectAttempt = 0; // trigger immediate reconnect attempt
 	}
 
@@ -197,11 +270,11 @@ void WiFi_Watchdog::watchdog() {
 		_lastReconnectAttempt = now;
 		_consecutiveFailures++;
 
-		if (_status != WiFiWatchdogStatus::RECONNECTING) {
-			setStatus(WiFiWatchdogStatus::RECONNECTING);
+		if (_status != WiFi_WatchdogStatus::RECONNECTING) {
+			setStatus(WiFi_WatchdogStatus::RECONNECTING);
 		}
 
-		if (_consecutiveFailures >= MAX_FAILURES_BEFORE_RESET) {
+		if (_consecutiveFailures >= _maxFailuresBeforeReset) {
 			WD_LOGLN(F("[WiFi Watchdog] Maximum failures reached, performing full reset..."));
 			performFullReset();
 		} else {
@@ -214,10 +287,10 @@ void WiFi_Watchdog::watchdog() {
 // =====================================================================
 // Status
 // =====================================================================
-WiFiWatchdogStatus WiFi_Watchdog::getStatus() {
+WiFi_WatchdogStatus WiFi_Watchdog::getStatus() {
 #if defined(ESP32)
 	portENTER_CRITICAL(&_mutex);
-	WiFiWatchdogStatus s = _status;
+	WiFi_WatchdogStatus s = _status;
 	portEXIT_CRITICAL(&_mutex);
 	return s;
 #else
@@ -248,7 +321,7 @@ String WiFi_Watchdog::getMACAddress() {
 // Configuration – call before connect()
 // =====================================================================
 void WiFi_Watchdog::setHostname(const char* hostname) {
-	_hostname = hostname;
+	copyString(_hostname, hostname);
 }
 
 void WiFi_Watchdog::useDHCP() {
@@ -260,10 +333,16 @@ void WiFi_Watchdog::setStaticIP(IPAddress ip, IPAddress gateway, IPAddress subne
 	_staticIP    = ip;
 	_gateway     = gateway;
 	_subnet      = subnet;
+	_hasDns      = false;
 }
 
-void WiFi_Watchdog::setWiFiMode(WiFiMode_t mode) {
-	_wifiMode = mode;
+void WiFi_Watchdog::setStaticIP(IPAddress ip, IPAddress gateway, IPAddress subnet, IPAddress dns) {
+	_useStaticIP = true;
+	_staticIP    = ip;
+	_gateway     = gateway;
+	_subnet      = subnet;
+	_dns         = dns;
+	_hasDns      = true;
 }
 
 void WiFi_Watchdog::setDebug(bool enable) {
@@ -281,11 +360,27 @@ void WiFi_Watchdog::enablePinger(bool enable) {
 }
 
 void WiFi_Watchdog::setPingInterval(unsigned long intervalMs) {
-	_pingInterval = intervalMs;
+	if (intervalMs < MIN_PING_INTERVAL || intervalMs > MAX_PING_INTERVAL) {
+		WD_LOG(F("[WiFi Watchdog] setPingInterval: clamping "));
+		WD_LOG(intervalMs);
+		WD_LOG(F(" to range "));
+		WD_LOG(MIN_PING_INTERVAL);
+		WD_LOG(F(".."));
+		WD_LOGLN(MAX_PING_INTERVAL);
+	}
+	_pingInterval = constrain(intervalMs, MIN_PING_INTERVAL, MAX_PING_INTERVAL);
 }
 
 void WiFi_Watchdog::setPingTimeout(unsigned long timeoutMs) {
-	_pingTimeout = timeoutMs;
+	if (timeoutMs < MIN_PING_TIMEOUT || timeoutMs > MAX_PING_TIMEOUT) {
+		WD_LOG(F("[WiFi Watchdog] setPingTimeout: clamping "));
+		WD_LOG(timeoutMs);
+		WD_LOG(F(" to range "));
+		WD_LOG(MIN_PING_TIMEOUT);
+		WD_LOG(F(".."));
+		WD_LOGLN(MAX_PING_TIMEOUT);
+	}
+	_pingTimeout = constrain(timeoutMs, MIN_PING_TIMEOUT, MAX_PING_TIMEOUT);
 }
 
 void WiFi_Watchdog::setPingTarget(IPAddress target) {
@@ -293,11 +388,54 @@ void WiFi_Watchdog::setPingTarget(IPAddress target) {
 	_hasPingTarget = true;
 }
 
+void WiFi_Watchdog::clearPingTarget() {
+	_hasPingTarget = false;
+}
+
+// =====================================================================
+// Threshold configuration
+// =====================================================================
+void WiFi_Watchdog::setMaxFailuresBeforeReset(uint8_t count) {
+	if (count < MIN_THRESHOLD || count > MAX_THRESHOLD) {
+		WD_LOG(F("[WiFi Watchdog] setMaxFailuresBeforeReset: clamping "));
+		WD_LOG(count);
+		WD_LOG(F(" to range "));
+		WD_LOG(MIN_THRESHOLD);
+		WD_LOG(F(".."));
+		WD_LOGLN(MAX_THRESHOLD);
+	}
+	_maxFailuresBeforeReset = constrain(count, MIN_THRESHOLD, MAX_THRESHOLD);
+}
+
+void WiFi_Watchdog::setPingFailThreshold(uint8_t count) {
+	if (count < MIN_THRESHOLD || count > MAX_THRESHOLD) {
+		WD_LOG(F("[WiFi Watchdog] setPingFailThreshold: clamping "));
+		WD_LOG(count);
+		WD_LOG(F(" to range "));
+		WD_LOG(MIN_THRESHOLD);
+		WD_LOG(F(".."));
+		WD_LOGLN(MAX_THRESHOLD);
+	}
+	_pingFailThreshold = constrain(count, MIN_THRESHOLD, MAX_THRESHOLD);
+}
+
+void WiFi_Watchdog::setReconnectInterval(unsigned long intervalMs) {
+	if (intervalMs < MIN_RECONNECT_INTERVAL || intervalMs > MAX_RECONNECT_INTERVAL) {
+		WD_LOG(F("[WiFi Watchdog] setReconnectInterval: clamping "));
+		WD_LOG(intervalMs);
+		WD_LOG(F(" to range "));
+		WD_LOG(MIN_RECONNECT_INTERVAL);
+		WD_LOG(F(".."));
+		WD_LOGLN(MAX_RECONNECT_INTERVAL);
+	}
+	_reconnectInterval = constrain(intervalMs, MIN_RECONNECT_INTERVAL, MAX_RECONNECT_INTERVAL);
+}
+
 // =====================================================================
 // Private helpers
 // =====================================================================
-void WiFi_Watchdog::setStatus(WiFiWatchdogStatus newStatus) {
-	WiFiWatchdogStatus oldStatus;
+void WiFi_Watchdog::setStatus(WiFi_WatchdogStatus newStatus) {
+	WiFi_WatchdogStatus oldStatus;
 
 #if defined(ESP32)
 	portENTER_CRITICAL(&_mutex);
@@ -321,9 +459,11 @@ void WiFi_Watchdog::setStatus(WiFiWatchdogStatus newStatus) {
 void WiFi_Watchdog::performFullReset() {
 	cleanupPing();
 	WiFi.disconnect(true);
-	delay(100);
-	yield();
-	WiFi.begin(_ssid, _password);
+
+	// Non-blocking: enter waiting phase, watchdog() will complete the reset
+	// (applyNetworkConfig + WiFi.begin are called when the phase completes)
+	_resetPhase = ResetPhase::WAITING_AFTER_DISCONNECT;
+	_resetStartTime = millis();
 	_consecutiveFailures = 0;
 }
 
@@ -331,10 +471,10 @@ void WiFi_Watchdog::applyNetworkConfig() {
 	// If no hostname was set, generate one from last 6 hex chars of MAC
 	if (_hostname == nullptr) {
 		String mac = WiFi.macAddress();    // "AA:BB:CC:DD:EE:FF"
-		static char autoName[13];          // "ESP_DDEEFF\0"
+		char autoName[13];                 // "ESP_DDEEFF\0"
 		snprintf(autoName, sizeof(autoName), "ESP_%c%c%c%c%c%c",
 			mac[9], mac[10], mac[12], mac[13], mac[15], mac[16]);
-		_hostname = autoName;
+		copyString(_hostname, autoName);
 	}
 
 #if defined(ESP8266)
@@ -344,7 +484,11 @@ void WiFi_Watchdog::applyNetworkConfig() {
 #endif
 
 	if (_useStaticIP) {
-		WiFi.config(_staticIP, _gateway, _subnet);
+		if (_hasDns) {
+			WiFi.config(_staticIP, _gateway, _subnet, _dns);
+		} else {
+			WiFi.config(_staticIP, _gateway, _subnet);
+		}
 	}
 }
 
@@ -380,26 +524,26 @@ void WiFi_Watchdog::sendPing() {
 	LOCK_TCPIP_CORE();
 #endif
 
-	// Create raw PCB for ICMP
-	_pingPcb = raw_new(IP_PROTO_ICMP);
+	// Create raw PCB for ICMP if not already allocated (reused across pings)
 	if (_pingPcb == nullptr) {
+		_pingPcb = raw_new(IP_PROTO_ICMP);
+		if (_pingPcb == nullptr) {
 #if defined(ESP32)
-		UNLOCK_TCPIP_CORE();
+			UNLOCK_TCPIP_CORE();
 #endif
-		WD_LOGLN(F("[WiFi Watchdog] Failed to create ICMP PCB"));
-		_lastPingTime = millis();
-		return;
-	}
+			WD_LOGLN(F("[WiFi Watchdog] Failed to create ICMP PCB"));
+			_lastPingTime = millis();
+			return;
+		}
 
-	// Register receive callback, pass 'this' so callback can set our flag
-	raw_recv(_pingPcb, icmpReceiveCallback, this);
+		// Register receive callback, pass 'this' so callback can set our flag
+		raw_recv(_pingPcb, icmpReceiveCallback, this);
+	}
 
 	// Allocate packet buffer for ICMP echo request
 	u16_t packetSize = sizeof(struct icmp_echo_hdr);
 	struct pbuf *p = pbuf_alloc(PBUF_IP, packetSize, PBUF_RAM);
 	if (p == nullptr) {
-		raw_remove(_pingPcb);
-		_pingPcb = nullptr;
 #if defined(ESP32)
 		UNLOCK_TCPIP_CORE();
 #endif
@@ -408,13 +552,16 @@ void WiFi_Watchdog::sendPing() {
 		return;
 	}
 
+	// Increment sequence number for each ping
+	_pingSeqNo++;
+
 	// Build ICMP echo request
 	struct icmp_echo_hdr *iecho = (struct icmp_echo_hdr *)p->payload;
 	ICMPH_TYPE_SET(iecho, ICMP_ECHO);
 	ICMPH_CODE_SET(iecho, 0);
 	iecho->chksum = 0;
 	iecho->id     = htons(PING_PACKET_ID);
-	iecho->seqno  = htons(1);
+	iecho->seqno  = htons(_pingSeqNo);
 	iecho->chksum = inet_chksum(iecho, packetSize);
 
 	// Send packet to target IP
@@ -446,7 +593,7 @@ void WiFi_Watchdog::checkPingReply() {
 	if (_icmpReplyReceived) {
 		WD_LOGLN(F("[WiFi Watchdog] ICMP reply OK"));
 		_pingFailCount = 0;
-		cleanupPing();
+		_pingState = PingState::IDLE;
 		_lastPingTime = millis();
 		return;
 	}
@@ -454,11 +601,17 @@ void WiFi_Watchdog::checkPingReply() {
 	// Timeout expired?
 	if (millis() - _pingSentTime >= _pingTimeout) {
 		WD_LOGLN(F("[WiFi Watchdog] ICMP timeout"));
-		cleanupPing();
+		_pingState = PingState::IDLE;
 		_lastPingTime = millis();
 
 		_pingFailCount++;
-		if (_pingFailCount >= PING_FAIL_THRESHOLD) {
+
+		WD_LOG(F("[WiFi Watchdog] Ping fail count: "));
+		WD_LOG(_pingFailCount);
+		WD_LOG(F(" / "));
+		WD_LOGLN(_pingFailThreshold);
+
+		if (_pingFailCount >= _pingFailThreshold) {
 			_pingFailCount = 0;
 			WD_LOGLN(F("[WiFi Watchdog] Gateway unreachable, resetting WiFi..."));
 			performFullReset();
@@ -485,5 +638,3 @@ void WiFi_Watchdog::cleanupPing() {
 	}
 	_pingState = PingState::IDLE;
 }
-
-

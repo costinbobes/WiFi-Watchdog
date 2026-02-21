@@ -36,29 +36,29 @@ WiFi_Watchdog wifiWatchdog;
  * This function is called whenever the WiFi connection status changes.
  * Use it to update your application state, trigger actions, or log events.
  */
-void onWiFiStatusChange(WiFiWatchdogStatus status) {
+void onWiFiStatusChange(WiFi_WatchdogStatus status) {
     switch (status) {
-        case WiFiWatchdogStatus::DISCONNECTED:
+        case WiFi_WatchdogStatus::DISCONNECTED:
             Serial.println(F("[WiFi] Disconnected"));
             break;
-            
-        case WiFiWatchdogStatus::CONNECTING:
+
+        case WiFi_WatchdogStatus::CONNECTING:
             Serial.println(F("[WiFi] Connecting..."));
             break;
-            
-        case WiFiWatchdogStatus::CONNECTED:
+
+        case WiFi_WatchdogStatus::CONNECTED:
             Serial.print(F("[WiFi] ✓ Connected  IP: "));
             Serial.print(wifiWatchdog.getIPAddress());
             Serial.print(F("  RSSI: "));
             Serial.print(wifiWatchdog.getSignalStrength());
             Serial.println(F(" dBm"));
             break;
-            
-        case WiFiWatchdogStatus::CONNECTION_LOST:
+
+        case WiFi_WatchdogStatus::CONNECTION_LOST:
             Serial.println(F("[WiFi] ✗ Connection lost!"));
             break;
-            
-        case WiFiWatchdogStatus::RECONNECTING:
+
+        case WiFi_WatchdogStatus::RECONNECTING:
             Serial.println(F("[WiFi] Reconnecting..."));
             break;
     }
@@ -90,7 +90,9 @@ void setup() {
     // IPAddress ip(192, 168, 1, 200);
     // IPAddress gw(192, 168, 1, 1);
     // IPAddress sn(255, 255, 255, 0);
-    // wifiWatchdog.setStaticIP(ip, gw, sn);
+    // IPAddress dns(8, 8, 8, 8);
+    // wifiWatchdog.setStaticIP(ip, gw, sn);        // DNS defaults to gateway
+    // wifiWatchdog.setStaticIP(ip, gw, sn, dns);   // or specify DNS explicitly
     
     // --- Connect to WiFi ---
     Serial.println(F("Connecting to WiFi..."));
